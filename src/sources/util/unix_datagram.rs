@@ -1,7 +1,13 @@
-use std::{fs::remove_file, path::PathBuf};
+use std::{
+    fs::remove_file,
+    io::{self, IoSliceMut},
+    os::fd::AsRawFd,
+    path::PathBuf,
+};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::StreamExt;
+use nix::sys::socket::{MsgFlags, MultiHeaders, recvmmsg};
 use tokio::net::UnixDatagram;
 use tracing::field;
 use vector_lib::{
@@ -29,10 +35,12 @@ use crate::{
 /// Passing in different functions for `decoder` and `handle_events` can allow
 /// for different source-specific logic (such as decoding syslog messages in the
 /// syslog source).
+#[allow(clippy::too_many_arguments)]
 pub fn build_unix_datagram_source(
     listen_path: PathBuf,
     socket_file_mode: Option<u32>,
     max_length: usize,
+    nr_buffers: usize,
     decoder: Decoder,
     handle_events: impl Fn(&mut [Event], Option<Bytes>) + Clone + Send + Sync + 'static,
     shutdown: ShutdownSignal,
@@ -40,12 +48,21 @@ pub fn build_unix_datagram_source(
 ) -> crate::Result<Source> {
     Ok(Box::pin(async move {
         let socket = UnixDatagram::bind(&listen_path).expect("Failed to bind to datagram socket");
-        info!(message = "Listening.", path = ?listen_path, r#type = "unix_datagram");
+        info!(message = "Listening.", path = ?listen_path, r#type = "unix_datagram", nr_buffers = nr_buffers, max_length = max_length);
 
         change_socket_permissions(&listen_path, socket_file_mode)
             .expect("Failed to set socket permissions");
 
-        let result = listen(socket, max_length, decoder, shutdown, handle_events, out).await;
+        let result = listen(
+            socket,
+            max_length,
+            nr_buffers,
+            decoder,
+            shutdown,
+            handle_events,
+            out,
+        )
+        .await;
 
         // Delete socket file.
         if let Err(error) = remove_file(&listen_path) {
@@ -62,73 +79,113 @@ pub fn build_unix_datagram_source(
 async fn listen(
     socket: UnixDatagram,
     max_length: usize,
+    nr_buffers: usize,
     decoder: Decoder,
     mut shutdown: ShutdownSignal,
     handle_events: impl Fn(&mut [Event], Option<Bytes>) + Clone + Send + Sync + 'static,
     mut out: SourceSender,
 ) -> Result<(), ()> {
-    let mut buf = BytesMut::with_capacity(max_length);
+    let mut buffers = vec![vec![0u8; max_length]; nr_buffers];
     let bytes_received = register!(BytesReceived::from(Protocol::UNIX));
+
+    let span = info_span!("datagram");
+    span.record("peer_path", field::debug(UNNAMED_SOCKET_HOST));
+    let received_from: Bytes = socket
+    .peer_addr()
+    .ok()
+    .and_then(|addr| {
+        addr.as_pathname().map(|e| e.to_owned()).map({
+            |path| {
+                span.record("peer_path", field::debug(&path));
+                path.to_string_lossy().into_owned().into()
+            }
+        })
+    })
+    // In most cases, we'll be connecting to this socket from
+    // an unnamed socket (a socket not bound to a
+    // file). Instead of a filename, we'll surface a specific
+    // host value.
+    .unwrap_or_else(|| UNNAMED_SOCKET_HOST.into());
+
+    let fd = socket.as_raw_fd();
+
+    let recvmmsg_size = metrics::gauge!("recvmmsg_size");
+
     loop {
-        buf.resize(max_length, 0);
         tokio::select! {
-            recv = socket.recv_from(&mut buf) => {
-                let (byte_size, address) = recv.map_err(|error| {
-                    let error = vector_lib::codecs::decoding::Error::FramingError(error.into());
-                    emit!(SocketReceiveError {
-                        mode: SocketMode::Unix,
-                        error: &error
-                    })
-                })?;
+            result = socket.async_io(tokio::io::Interest::READABLE, || {
+                let mut headers = MultiHeaders::<()>::preallocate(nr_buffers, None);
+                let mut iovecs: Vec<[IoSliceMut; 1]> = buffers
+                    .iter_mut()
+                    .map(|buffer| [IoSliceMut::new(buffer)])
+                    .collect();
 
-                let span = info_span!("datagram");
-                let received_from = if !address.is_unnamed() {
-                    let path = address.as_pathname().map(|e| e.to_owned()).inspect(|path| {
-                        span.record("peer_path", field::debug(path));
-                    });
+                let lengths = recvmmsg(
+                    fd,
+                    &mut headers,
+                    iovecs.iter_mut(),
+                    MsgFlags::MSG_DONTWAIT,
+                    None,
+                )
+                .map_err(|errno| io::Error::from_raw_os_error(errno as i32))?
+                .map(|msg| msg.bytes)
+                .collect::<Vec<usize>>();
 
-                    path.map(|p| p.to_string_lossy().into_owned().into())
-                } else {
-                    // In most cases, we'll be connecting to this
-                    // socket from an unnamed socket (a socket not
-                    // bound to a file). Instead of a filename, we'll
-                    // surface a specific host value.
-                    span.record("peer_path", field::debug(UNNAMED_SOCKET_HOST));
-                    Some(UNNAMED_SOCKET_HOST.into())
+                Ok(lengths)
+            }) => {
+                let lengths = match result {
+                    Ok(lengths) => lengths,
+                    Err(error) => {
+                        let error = vector_lib::codecs::decoding::Error::FramingError(error.into());
+                        emit!(SocketReceiveError {
+                            mode: SocketMode::Unix,
+                            error: &error
+                        });
+                        return Err(());
+                    }
                 };
 
-                bytes_received.emit(ByteSize(byte_size));
+                recvmmsg_size.set(lengths.len() as f64);
 
-                let payload = buf.split_to(byte_size);
+                let mut batch: Vec<Event> = Vec::with_capacity(lengths.len());
 
-                let mut stream = DecoderFramedRead::new(payload.as_ref(), decoder.clone());
+                for (buffer, &length) in buffers.iter().zip(&lengths) {
+                    let data = &buffer[..length];
 
-                loop {
-                    match stream.next().await {
-                        Some(Ok((mut events, _byte_size))) => {
-                            emit!(SocketEventsReceived {
-                                mode: SocketMode::Unix,
-                                byte_size: events.estimated_json_encoded_size_of(),
-                                count: events.len()
-                            });
+                    bytes_received.emit(ByteSize(data.len()));
 
-                            handle_events(&mut events, received_from.clone());
+                    let mut stream = DecoderFramedRead::new(data.as_ref(), decoder.clone());
 
-                            let count = events.len();
-                            if (out.send_batch(events).await).is_err() {
-                                emit!(StreamClosedError { count });
-                            }
-                        },
-                        Some(Err(error)) => {
-                            emit!(SocketReceiveError {
-                                mode: SocketMode::Unix,
-                                error: &error
-                            });
-                            if !error.can_continue() {
-                                break;
-                            }
-                        },
-                        None => break,
+                    while let Some(result) = stream.next().await {
+                        match result {
+                            Ok((mut events, _byte_size)) => {
+                                emit!(SocketEventsReceived {
+                                    mode: SocketMode::Unix,
+                                    byte_size: events.estimated_json_encoded_size_of(),
+                                    count: events.len()
+                                });
+
+                                handle_events(&mut events, Some(received_from.clone()));
+
+                                batch.extend(events);
+                            },
+                            Err(error) => {
+                                emit!(SocketReceiveError {
+                                    mode: SocketMode::Unix,
+                                    error: &error
+                                });
+                                if !error.can_continue() {
+                                    break;
+                                }
+                            },
+                        }
+                    }
+                }
+
+                if !batch.is_empty() {
+                    let count = batch.len();
+                    if (out.send_batch(batch).await).is_err() {
+                        emit!(StreamClosedError { count });
                     }
                 }
             }

@@ -22,6 +22,11 @@ use crate::{
     },
 };
 
+/// Receive one message per `recvmmsg` call
+const fn default_recvmmsg_buffers() -> usize {
+    1
+}
+
 /// Unix domain socket configuration for the `socket` source.
 #[configurable_component]
 #[derive(Clone, Debug)]
@@ -41,6 +46,18 @@ pub struct UnixConfig {
     #[configurable(metadata(docs::examples = 0o600))]
     #[configurable(metadata(docs::examples = 508))]
     pub socket_file_mode: Option<u32>,
+
+    /// Maximum number of messages to receive in a single `recvmmsg` call.
+    ///
+    /// Buffers are allocated up front, so the memory held per socket is this value multiplied
+    /// by `max_length`.
+    #[configurable(derived)]
+    #[serde(default = "default_recvmmsg_buffers")]
+    pub recvmmsg_buffers: usize,
+
+    /// Maximum message size per `recvmmsg`` buffer.
+    #[configurable(derived)]
+    pub max_length: Option<usize>,
 
     /// Overrides the name of the log field used to add the peer host to each event.
     ///
@@ -71,6 +88,8 @@ impl UnixConfig {
         Self {
             path,
             socket_file_mode: None,
+            recvmmsg_buffers: default_recvmmsg_buffers(),
+            max_length: None,
             host_key: default_host_key(),
             framing: None,
             decoding: default_decoding(),
@@ -129,6 +148,7 @@ pub(super) fn unix_datagram(
             FramingConfig::CharacterDelimited(config) => config.character_delimited.max_length,
             FramingConfig::NewlineDelimited(config) => config.newline_delimited.max_length,
             FramingConfig::OctetCounting(config) => config.octet_counting.max_length,
+            FramingConfig::Bytes => config.max_length,
             _ => None,
         })
         .unwrap_or_else(crate::serde::default_max_length);
@@ -137,6 +157,7 @@ pub(super) fn unix_datagram(
         config.path,
         config.socket_file_mode,
         max_length,
+        config.recvmmsg_buffers,
         decoder,
         move |events, received_from| {
             handle_events(events, &config.host_key, received_from, log_namespace)
